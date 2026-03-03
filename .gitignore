@@ -1,7 +1,10 @@
+# models (do not upload trained model binaries)
 models/*.pkl
-__pycache__/
-*.pyc
-.DS_Store
-.ipynb_checkpoints/
-.env
-.venv
+models/*.joblib
+models/*.sav
+models/*.h5
+models/*.onnx
+
+# optional: ignore all models except metrics
+# models/*
+# !models/battery_model_metrics.json
