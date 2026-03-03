@@ -1,247 +1,302 @@
-import streamlit as st
-import pandas as pd
-import numpy as np
-from pathlib import Path
 import json
+from pathlib import Path
 
-# -----------------------------
-# Page config
-# -----------------------------
+import numpy as np
+import pandas as pd
+import streamlit as st
+
+# ML
+from sklearn.model_selection import train_test_split
+from sklearn.ensemble import RandomForestRegressor
+from sklearn.metrics import mean_squared_error, r2_score
+import joblib
+
+# ----------------------------
+# Paths (repo-relative)
+# ----------------------------
+APP_DIR = Path(__file__).resolve().parent           # .../app
+REPO_DIR = APP_DIR.parent                          # repo root
+DATA_RAW = REPO_DIR / "data" / "raw" / "device_telemetry.csv"
+DATA_EXPLAIN = REPO_DIR / "data" / "processed" / "telemetry_with_explanations.csv"
+
+MODELS_DIR = REPO_DIR / "models"
+MODEL_PATH = MODELS_DIR / "battery_model.pkl"
+METRICS_PATH = MODELS_DIR / "battery_model_metrics.json"
+
+# ----------------------------
+# Streamlit config
+# ----------------------------
 st.set_page_config(
-    page_title="ADHIS - Privacy-First AI Device Intelligence",
-    page_icon="🔋",
+    page_title="ADHIS - Privacy-First AI Device Intelligence Platform",
     layout="wide",
+    initial_sidebar_state="expanded",
 )
 
-# -----------------------------
-# Paths (works locally + Streamlit Cloud)
-# app/streamlit_app.py  -> project root is parent of app/
-# -----------------------------
-APP_DIR = Path(__file__).resolve().parent
-ROOT_DIR = APP_DIR.parent
-
-DATA_RAW = ROOT_DIR / "data" / "raw" / "device_telemetry.csv"
-DATA_PROCESSED = ROOT_DIR / "data" / "processed" / "telemetry_with_explanations.csv"
-METRICS_PATH = ROOT_DIR / "models" / "battery_model_metrics.json"
-
-# -----------------------------
-# Styling (simple dark look)
-# -----------------------------
-st.markdown(
-    """
-    <style>
-      .small-subtitle {opacity: 0.75; margin-top: -10px;}
-      .kpi-card {padding: 14px; border-radius: 14px; background: rgba(255,255,255,0.03); border: 1px solid rgba(255,255,255,0.06);}
-      .muted {opacity:0.75;}
-    </style>
-    """,
-    unsafe_allow_html=True,
-)
-
-# -----------------------------
+# ----------------------------
 # Helpers
-# -----------------------------
-@st.cache_data(show_spinner=False)
-def load_processed_data():
-    if DATA_PROCESSED.exists():
-        return pd.read_csv(DATA_PROCESSED)
-    # fallback to raw if processed is missing
-    if DATA_RAW.exists():
-        df = pd.read_csv(DATA_RAW)
-        # minimal columns so app still works
-        if "cluster_name" not in df.columns:
-            df["cluster_name"] = "Unknown"
-        if "anomaly_flag" not in df.columns:
-            df["anomaly_flag"] = 1
-        if "genai_explanation" not in df.columns:
-            df["genai_explanation"] = "No explanation file found yet. Run Notebook 06."
-        df["predicted_battery_health"] = df.get("battery_health", np.nan)
-        return df
-    return None
+# ----------------------------
+@st.cache_data
+def load_explanations_csv(path: Path) -> pd.DataFrame:
+    return pd.read_csv(path)
 
+@st.cache_data
+def load_raw_telemetry(path: Path) -> pd.DataFrame:
+    return pd.read_csv(path)
 
-@st.cache_data(show_spinner=False)
-def load_metrics():
-    if METRICS_PATH.exists():
-        with open(METRICS_PATH, "r") as f:
-            return json.load(f)
-    return None
+def load_metrics(path: Path) -> dict | None:
+    if not path.exists():
+        return None
+    try:
+        return json.loads(path.read_text())
+    except Exception:
+        return None
 
+def save_metrics(path: Path, metrics: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(metrics, indent=2))
 
-def risk_flags(row, overheating_threshold=42.0, low_batt_threshold=70.0):
-    # anomaly_flag: 1=normal, -1=anomaly (as per your notebook)
-    overheating_risk = False
-    low_battery_risk = False
+def train_and_save_model(raw_df: pd.DataFrame) -> dict:
+    """
+    Train RF model and save it locally. Also return + save metrics.
+    """
+    target = "battery_health"
+    drop_cols = ["device_id", target]
 
-    avg_temp = float(row.get("avg_temp", 0))
-    pred = row.get("predicted_battery_health", row.get("battery_health", np.nan))
-    anomaly_flag = int(row.get("anomaly_flag", 1))
+    X = raw_df.drop(columns=drop_cols)
+    y = raw_df[target]
 
-    if anomaly_flag == -1 and avg_temp > overheating_threshold:
-        overheating_risk = True
+    X_train, X_test, y_train, y_test = train_test_split(
+        X, y, test_size=0.2, random_state=42
+    )
 
-    if pd.notna(pred) and float(pred) < low_batt_threshold:
-        low_battery_risk = True
+    model = RandomForestRegressor(n_estimators=200, random_state=42)
+    model.fit(X_train, y_train)
 
-    return overheating_risk, low_battery_risk
+    preds = model.predict(X_test)
+    rmse = float(np.sqrt(mean_squared_error(y_test, preds)))
+    r2 = float(r2_score(y_test, preds))
 
+    # Save model locally (DO NOT upload this to GitHub)
+    MODELS_DIR.mkdir(parents=True, exist_ok=True)
+    joblib.dump(model, MODEL_PATH)
 
-# -----------------------------
-# Load data
-# -----------------------------
-df = load_processed_data()
-metrics = load_metrics()
+    # Feature importance
+    importances = pd.Series(model.feature_importances_, index=X.columns).sort_values(ascending=False)
 
+    metrics = {
+        "rmse": rmse,
+        "r2": r2,
+        "n_records": int(raw_df.shape[0]),
+        "n_features": int(X.shape[1]),
+        "features": list(X.columns),
+        "feature_importance": {k: float(v) for k, v in importances.to_dict().items()},
+        "model_file": str(MODEL_PATH.as_posix()),
+    }
+    save_metrics(METRICS_PATH, metrics)
+    return metrics
+
+def get_prediction_from_model(model, row: pd.Series) -> float:
+    feature_cols = ["battery_cycles", "avg_temp", "screen_on_time", "fast_charging_count", "cpu_usage"]
+    X_row = pd.DataFrame([row[feature_cols].values], columns=feature_cols)
+    return float(model.predict(X_row)[0])
+
+# ----------------------------
+# UI Header
+# ----------------------------
 st.title("Privacy-First AI Device Intelligence Platform")
-st.markdown(
-    '<div class="small-subtitle">Battery prediction • Anomaly detection • Usage segmentation • GenAI-style explanations</div>',
-    unsafe_allow_html=True,
-)
+st.caption("Battery prediction • Anomaly detection • Usage segmentation • GenAI-style explanations")
 
-if df is None:
-    st.error("No dataset found. Please add: data/raw/device_telemetry.csv (and/or processed files).")
+# ----------------------------
+# Load data (processed explanations)
+# ----------------------------
+if not DATA_EXPLAIN.exists():
+    st.error(f"Missing data file: {DATA_EXPLAIN}")
     st.stop()
 
-# Ensure columns exist for consistent UI
-if "predicted_battery_health" not in df.columns:
-    # If you didn't store predictions in processed file, we fallback to battery_health
-    df["predicted_battery_health"] = df.get("battery_health", np.nan)
+df = load_explanations_csv(DATA_EXPLAIN)
 
-if "cluster_name" not in df.columns:
-    df["cluster_name"] = "Unknown"
+# Basic validation
+required_cols = {"device_id", "battery_health", "avg_temp", "cluster_name", "genai_explanation"}
+missing = required_cols - set(df.columns)
+if missing:
+    st.error(f"Missing required columns in {DATA_EXPLAIN}: {missing}")
+    st.stop()
 
-if "anomaly_flag" not in df.columns:
-    df["anomaly_flag"] = 1
-
-if "genai_explanation" not in df.columns:
-    df["genai_explanation"] = "Explanation not found. Run Notebook 06 to generate telemetry_with_explanations.csv"
-
-# -----------------------------
-# Sidebar Controls
-# -----------------------------
+# ----------------------------
+# Sidebar controls
+# ----------------------------
 st.sidebar.header("Controls")
 
-device_ids = sorted(df["device_id"].unique().tolist()) if "device_id" in df.columns else list(range(1, len(df) + 1))
+device_ids = df["device_id"].astype(int).sort_values().unique().tolist()
 default_device = device_ids[0] if device_ids else 1
 
 selected_device = st.sidebar.selectbox("Select device_id", device_ids, index=0)
 
-overheating_threshold = st.sidebar.slider("Overheating threshold (°C)", 35, 55, 42)
+overheat_threshold = st.sidebar.slider("Overheating threshold (°C)", 35, 55, 42)
 low_battery_threshold = st.sidebar.slider("Low battery health threshold", 50, 90, 70)
 
-# -----------------------------
-# Selected row
-# -----------------------------
-row = df[df["device_id"] == selected_device].iloc[0] if "device_id" in df.columns else df.iloc[0]
-overheat_risk, low_batt_risk = risk_flags(row, overheating_threshold, low_battery_threshold)
+st.sidebar.divider()
 
-# -----------------------------
+# Retrain button (manual)
+st.sidebar.subheader("Model Management")
+retrain_clicked = st.sidebar.button("🔁 Retrain Model (Random Forest)")
+
+# ----------------------------
+# Retrain model logic
+# ----------------------------
+if retrain_clicked:
+    if not DATA_RAW.exists():
+        st.sidebar.error(f"Missing raw dataset: {DATA_RAW}")
+    else:
+        raw_df = load_raw_telemetry(DATA_RAW)
+        metrics = train_and_save_model(raw_df)
+        st.sidebar.success("✅ Trained new model and saved locally")
+        st.sidebar.write(f"RMSE: **{metrics['rmse']:.3f}**")
+        st.sidebar.write(f"R²: **{metrics['r2']:.3f}**")
+
+# ----------------------------
+# Load metrics (if exists)
+# ----------------------------
+metrics = load_metrics(METRICS_PATH)
+
+# Try loading model if exists
+model = None
+if MODEL_PATH.exists():
+    try:
+        model = joblib.load(MODEL_PATH)
+    except Exception:
+        model = None
+
+# ----------------------------
 # System overview KPIs
-# -----------------------------
-total_devices = int(df["device_id"].nunique()) if "device_id" in df.columns else int(df.shape[0])
-anomalies_detected = int((df["anomaly_flag"] == -1).sum()) if "anomaly_flag" in df.columns else 0
-avg_battery = float(df["predicted_battery_health"].mean()) if "predicted_battery_health" in df.columns else float(df["battery_health"].mean())
+# ----------------------------
+total_devices = int(df["device_id"].nunique())
+avg_battery = float(df["battery_health"].mean())
 
-st.subheader("System Overview")
-k1, k2, k3 = st.columns(3)
-with k1:
-    st.markdown('<div class="kpi-card">Total Devices<br><h2 style="margin:0;">{}</h2></div>'.format(total_devices), unsafe_allow_html=True)
-with k2:
-    st.markdown('<div class="kpi-card">Anomalies Detected<br><h2 style="margin:0;">{}</h2></div>'.format(anomalies_detected), unsafe_allow_html=True)
-with k3:
-    st.markdown('<div class="kpi-card">Average Battery Health<br><h2 style="margin:0;">{:.2f}</h2></div>'.format(avg_battery), unsafe_allow_html=True)
-
-st.divider()
-
-# -----------------------------
-# ✅ NEW: Model Performance (RMSE + R²)
-# -----------------------------
-st.subheader("Model Performance (Regression)")
-
-if metrics is None:
-    st.warning("Metrics file not found: models/battery_model_metrics.json\n\nRun Notebook 03 and make sure the file is saved & pushed to GitHub.")
+# Some anomaly logic (if anomaly_flag exists else derive from temp)
+if "anomaly_flag" in df.columns:
+    anomalies_detected = int((df["anomaly_flag"] == -1).sum())
 else:
-    m1, m2, m3, m4 = st.columns(4)
-    with m1:
-        st.metric("RMSE", f"{metrics.get('rmse', 0):.3f}")
-    with m2:
-        st.metric("R²", f"{metrics.get('r2', 0):.4f}")
-    with m3:
-        st.metric("Records used", f"{metrics.get('n_records', 'NA')}")
-    with m4:
-        st.metric("Features used", f"{metrics.get('n_features', 'NA')}")
+    anomalies_detected = int((df["avg_temp"] > overheat_threshold).sum())
 
-    st.caption(
-        "RMSE lower is better. R² closer to 1.0 is better. "
-        "These metrics are saved from Notebook 03 and displayed here for recruiters."
-    )
-
-st.divider()
-
-# -----------------------------
-# Main KPI area: Prediction / Segment / Risk
-# -----------------------------
 c1, c2, c3 = st.columns(3)
-
-pred_val = float(row.get("predicted_battery_health", row.get("battery_health", np.nan)))
-cluster_val = str(row.get("cluster_name", "Unknown"))
-anomaly_flag = int(row.get("anomaly_flag", 1))
-
 with c1:
-    st.markdown("### Predicted Battery Health")
-    st.metric("Prediction", f"{pred_val:.2f}")
-
+    st.subheader("System Overview")
+    st.metric("Total Devices", total_devices)
 with c2:
-    st.markdown("### Segment")
-    st.metric("Cluster", cluster_val)
-
+    st.subheader(" ")
+    st.metric("Anomalies Detected", anomalies_detected)
 with c3:
-    st.markdown("### Risk Status")
-    st.write(f"**Anomaly flag:** {anomaly_flag} (1 = normal, -1 = anomaly)")
-    st.write(f"**Overheating risk:** {'✅ Yes' if overheat_risk else '❌ No'}")
-    st.write(f"**Low battery risk:** {'✅ Yes' if low_batt_risk else '❌ No'}")
+    st.subheader(" ")
+    st.metric("Average Battery Health", f"{avg_battery:.2f}")
 
 st.divider()
 
-# -----------------------------
-# Telemetry Snapshot
-# -----------------------------
-st.subheader("Telemetry Snapshot")
-snap_cols = ["battery_cycles", "avg_temp", "screen_on_time", "fast_charging_count", "cpu_usage", "battery_health"]
-snap_cols = [c for c in snap_cols if c in df.columns]
-st.dataframe(pd.DataFrame([row[snap_cols].to_dict()]), use_container_width=True)
+# ----------------------------
+# Selected device view
+# ----------------------------
+row = df.loc[df["device_id"] == selected_device].iloc[0]
 
-# -----------------------------
-# GenAI Explanation
-# -----------------------------
+left, mid, right = st.columns(3)
+
+# Prediction card
+with left:
+    st.subheader("Predicted Battery Health")
+    if model is not None:
+        pred = get_prediction_from_model(model, row)
+        st.metric("Prediction", f"{pred:.2f}")
+    else:
+        st.metric("Prediction", "Not trained")
+        st.caption("Click **Retrain Model** in the sidebar to generate predictions.")
+
+# Segment card
+with mid:
+    st.subheader("Segment")
+    st.write("Cluster")
+    st.markdown(f"### {row.get('cluster_name', 'Unknown')}")
+
+# Risk status card
+with right:
+    st.subheader("Risk Status")
+
+    # anomaly
+    if "anomaly_flag" in df.columns:
+        anomaly_ok = int(row["anomaly_flag"]) == 1
+        anomaly_text = "✅ Normal" if anomaly_ok else "⚠️ Anomaly"
+    else:
+        anomaly_ok = float(row["avg_temp"]) <= overheat_threshold
+        anomaly_text = "✅ Normal" if anomaly_ok else "⚠️ Overheating"
+
+    overheat_risk = float(row["avg_temp"]) > overheat_threshold
+    low_battery_risk = float(row["battery_health"]) < low_battery_threshold
+
+    st.write(f"Anomaly: **{anomaly_text}**")
+    st.write(f"Overheating risk: {'❌ Yes' if overheat_risk else '✅ No'}")
+    st.write(f"Low battery risk: {'❌ Yes' if low_battery_risk else '✅ No'}")
+
+st.divider()
+
+# Telemetry snapshot
+st.subheader("Telemetry Snapshot")
+show_cols = [c for c in ["battery_cycles","avg_temp","screen_on_time","fast_charging_count","cpu_usage","battery_health"] if c in df.columns]
+st.dataframe(pd.DataFrame([row[show_cols].to_dict()]))
+
+# GenAI explanation
 st.subheader("GenAI Explanation")
 st.info(str(row.get("genai_explanation", "No explanation available.")))
 
 st.divider()
 
-# -----------------------------
-# Quick View: At-Risk Devices
-# -----------------------------
-st.subheader("Quick View: At-Risk Devices (sample)")
+# ----------------------------
+# Model Performance Metrics Section
+# ----------------------------
+st.subheader("Model Performance (Recruiter-ready)")
+if metrics is None:
+    st.warning("No saved metrics found yet. Click **Retrain Model** to generate RMSE + R².")
+else:
+    m1, m2, m3 = st.columns(3)
+    with m1:
+        st.metric("RMSE", f"{metrics['rmse']:.3f}")
+    with m2:
+        st.metric("R²", f"{metrics['r2']:.3f}")
+    with m3:
+        st.metric("Training Records", metrics.get("n_records", "N/A"))
 
-tmp = df.copy()
-tmp["overheating_risk"] = tmp.apply(lambda r: risk_flags(r, overheating_threshold, low_battery_threshold)[0], axis=1)
-tmp["low_battery_risk"] = tmp.apply(lambda r: risk_flags(r, overheating_threshold, low_battery_threshold)[1], axis=1)
-
-at_risk = tmp[(tmp["overheating_risk"] == True) | (tmp["low_battery_risk"] == True)]
-cols_show = ["device_id", "cluster_name", "avg_temp", "cpu_usage", "predicted_battery_health", "overheating_risk", "low_battery_risk"]
-cols_show = [c for c in cols_show if c in at_risk.columns]
-
-st.dataframe(at_risk[cols_show].head(15), use_container_width=True)
+    st.write("**Feature Importance**")
+    fi = metrics.get("feature_importance", {})
+    if fi:
+        fi_series = pd.Series(fi).sort_values(ascending=False)
+        st.bar_chart(fi_series)
+    else:
+        st.caption("No feature importance saved.")
 
 st.divider()
 
-# -----------------------------
-# Cluster distribution (simple)
-# -----------------------------
-st.subheader("Cluster Distribution")
+# ----------------------------
+# Quick view table (at-risk sample)
+# ----------------------------
+st.subheader("Quick View: At-Risk Devices (sample)")
 
-cluster_counts = df["cluster_name"].value_counts(dropna=False)
-st.bar_chart(cluster_counts)
+tmp = df.copy()
+tmp["overheating_risk"] = tmp["avg_temp"] > overheat_threshold
+tmp["low_battery_risk"] = tmp["battery_health"] < low_battery_threshold
 
-st.caption("✅ If you want, next we can add: retrain button, PDF report, Docker, CI/CD badge, architecture diagram.")
+# Optional predicted col if model exists
+if model is not None:
+    preds = []
+    for _, r in tmp.iterrows():
+        try:
+            preds.append(get_prediction_from_model(model, r))
+        except Exception:
+            preds.append(np.nan)
+    tmp["predicted_battery_health"] = preds
+
+cols_to_show = ["device_id", "cluster_name", "avg_temp", "cpu_usage", "battery_health", "overheating_risk", "low_battery_risk"]
+if "predicted_battery_health" in tmp.columns:
+    cols_to_show.insert(5, "predicted_battery_health")
+
+st.dataframe(
+    tmp.loc[(tmp["overheating_risk"] | tmp["low_battery_risk"]), cols_to_show]
+      .head(20)
+      .reset_index(drop=True)
+)
