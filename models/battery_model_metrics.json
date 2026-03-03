@@ -1,0 +1,21 @@
+{
+  "rmse": 2.4225087317457707,
+  "r2": 0.9097653508410397,
+  "n_records": 5000,
+  "n_features": 5,
+  "features": [
+    "battery_cycles",
+    "avg_temp",
+    "screen_on_time",
+    "fast_charging_count",
+    "cpu_usage"
+  ],
+  "feature_importance": {
+    "battery_cycles": 0.46173100817776214,
+    "cpu_usage": 0.23773179688638454,
+    "avg_temp": 0.1847641917666655,
+    "fast_charging_count": 0.10329971883002481,
+    "screen_on_time": 0.012473284339163095
+  },
+  "model_file": "/Users/ganeshbudida/Desktop/ai-device-health/models/battery_model.pkl"
+}
