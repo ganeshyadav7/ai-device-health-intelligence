@@ -93,6 +93,8 @@ def train_and_save_model(raw_df: pd.DataFrame) -> dict:
         "model_file": str(MODEL_PATH.as_posix()),
     }
     save_metrics(METRICS_PATH, metrics)
+    st.sidebar.write("Metrics saved at:", str(METRICS_PATH))
+st.sidebar.write("Exists now?", METRICS_PATH.exists())
     return metrics
 
 def get_prediction_from_model(model, row: pd.Series) -> float:
